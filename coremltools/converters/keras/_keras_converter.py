@@ -147,16 +147,107 @@ def _load_keras_model(model_network_path, model_weight_path, custom_objects=None
 
     return loaded_model
 
+
+def _convert_multiarray_output_to_image(spec,  # type: Any
+                                        feature_name,  # type: Text
+                                        is_bgr=False,  # type: bool
+                                        ):
+    # type: (...) -> None
+    for output in spec.description.output:
+        if output.name != feature_name:
+            continue
+        if output.type.WhichOneof('Type') != 'multiArrayType':
+            raise ValueError(
+                "{} is not a multiarray type".format(output.name,)
+            )
+        array_shape = tuple(output.type.multiArrayType.shape)
+        if len(array_shape) == 2:
+            height, width = array_shape
+            output.type.imageType.colorSpace = \
+                ft.ImageFeatureType.ColorSpace.Value('GRAYSCALE')
+        else:
+            if len(array_shape) == 4:
+                if array_shape[0] != 1:
+                    raise ValueError(
+                        "Shape {} is not supported for image output"
+                        .format(array_shape,)
+                    )
+                array_shape = array_shape[1:]
+
+            channels, height, width = array_shape
+
+            if channels == 1:
+                output.type.imageType.colorSpace = \
+                    ft.ImageFeatureType.ColorSpace.Value('GRAYSCALE')
+            elif channels == 3:
+                if is_bgr:
+                    output.type.imageType.colorSpace = \
+                        ft.ImageFeatureType.ColorSpace.Value('BGR')
+                else:
+                    output.type.imageType.colorSpace = \
+                        ft.ImageFeatureType.ColorSpace.Value('RGB')
+            else:
+                raise ValueError(
+                    "Channel Value {} is not supported for image output"
+                    .format(channels,)
+                )
+
+        output.type.imageType.width = width
+        output.type.imageType.height = height
+
+def _set_deprocessing(is_grayscale,  # type: bool
+                      builder,  # type: NeuralNetworkBuilder
+                      deprocessing_args,  # type: Dict[Text, Any]
+                      input_name,  # type: Text
+                      output_name,  # type: Text
+                      ):
+    # type: (...) -> None
+    is_bgr = deprocessing_args.get('is_bgr', False)
+
+    image_scale = deprocessing_args.get('image_scale', 1.0)
+
+    if is_grayscale:
+        gray_bias = deprocessing_args.get('gray_bias', 0.0)
+        W = np.array([image_scale])
+        b = np.array([gray_bias])
+    else:
+        W = np.array([image_scale, image_scale, image_scale])
+
+        red_bias = deprocessing_args.get('red_bias', 0.0)
+        green_bias = deprocessing_args.get('green_bias', 0.0)
+        blue_bias = deprocessing_args.get('blue_bias', 0.0)
+
+        if not is_bgr:
+            b = np.array([
+                red_bias,
+                green_bias,
+                blue_bias,
+            ])
+        else:
+            b = np.array([
+                blue_bias,
+                green_bias,
+                red_bias,
+            ])
+    builder.add_scale(
+        name=output_name,
+        W=W,
+        b=b,
+        has_bias=True,
+        shape_scale=W.shape,
+        shape_bias=b.shape,
+        input_name=input_name,
+        output_name=output_name
+    )
+
+
 def _convert(model, 
             input_names = None, 
             output_names = None, 
             image_input_names = None, 
-            is_bgr = False, 
-            red_bias = 0.0, 
-            green_bias = 0.0, 
-            blue_bias = 0.0, 
-            gray_bias = 0.0, 
-            image_scale = 1.0, 
+            preprocessing_args = {},
+            image_output_names = None,
+            deprocessing_args = {},
             class_labels = None, 
             predicted_feature_name = None,
             predicted_probabilities_output = '',
@@ -288,6 +379,7 @@ def _convert(model,
         input_names, output_names = graph.get_layer_blobs(layer)
         converter_func(builder, layer, input_names, output_names, keras_layer)
 
+
     # Set the right inputs and outputs on the model description (interface)
     builder.set_input(input_names, input_dims)
     builder.set_output(output_names, output_dims)
@@ -316,15 +408,63 @@ def _convert(model,
                                      prediction_blob = predicted_probabilities_output)
         else:
             builder.set_class_labels(classes)
-
+    pre_is_bgr = preprocessing_args.get('is_bgr', False)
+    pre_is_bias = preprocessing_args.get('red_bias', 0.0)
+    pre_green_bias = preprocessing_args.get('green_bias', 0.0)
+    pre_blue_bias = preprocessing_args.get('blue_bias', 0.0)
+    pre_gray_bias = preprocessing_args.get('gray_bias', 0.0)
+    pre_image_scale = preprocessing_args.get('image_scale', 1.0)
     # Set pre-processing paramsters
     builder.set_pre_processing_parameters(image_input_names = image_input_names, 
-                                          is_bgr = is_bgr, 
-                                          red_bias = red_bias, 
-                                          green_bias = green_bias, 
-                                          blue_bias = blue_bias, 
-                                          gray_bias = gray_bias, 
-                                          image_scale = image_scale)
+                                          is_bgr = pre_is_bgr, 
+                                          red_bias = pre_is_bias, 
+                                          green_bias = pre_green_bias, 
+                                          blue_bias = pre_blue_bias, 
+                                          gray_bias = pre_gray_bias, 
+                                          image_scale = pre_image_scale)
+
+    is_deprocess_bgr_only = (len(deprocessing_args) == 1) and \
+                            ("is_bgr" in deprocessing_args)
+    add_deprocess = (len(image_output_names) > 0) and \
+                    (len(deprocessing_args) > 0) and \
+                    (not is_deprocess_bgr_only)
+
+    post_is_bgr = deprocessing_args.get('is_bgr', False)
+
+    raise ValueError("Fuck this shit")
+
+    if add_deprocess:
+        for f in output_features:
+            print("Deprocess %s" % (str(f), ))
+            output_name = f[0]
+            if output_name not in image_output_names:
+                continue
+            output_shape = f[1].dimensions
+            if len(output_shape) == 2 or output_shape[0] == 1:
+                is_grayscale = True
+            elif output_shape[0] == 3:
+                is_grayscale = False
+            else:
+                raise ValueError('Output must be RGB image or Grayscale')
+
+            deprocessed_name = "deprocessed_" + output_name
+
+            _set_deprocessing(
+                is_grayscale,
+                builder,
+                deprocessing_args,
+                output_name,
+                deprocessed_name)
+
+            _convert_multiarray_output_to_image(
+                builder.spec, deprocessed_name, is_bgr=post_is_bgr)
+
+            output_names.remove(output_name)
+            output_names.add(deprocessed_name)
+    else:
+        print ("skip deprocesssing")
+
+    builder.set_output(output_names, output_dims)
 
     # Return the protobuf spec
     spec = builder.spec
@@ -334,13 +474,10 @@ def convertToSpec(model,
                   input_names = None,
                   output_names = None,
                   image_input_names = None,
+                  preprocessing_args = {},
+                  image_output_names = None,
+                  deprocessing_args = {},
                   input_name_shape_dict = {},
-                  is_bgr = False,
-                  red_bias = 0.0,
-                  green_bias = 0.0,
-                  blue_bias = 0.0,
-                  gray_bias = 0.0,
-                  image_scale = 1.0,
                   class_labels = None,
                   predicted_feature_name = None,
                   model_precision = _MLMODEL_FULL_PRECISION,
@@ -525,12 +662,9 @@ def convertToSpec(model,
                          input_names=input_names,
                          output_names=output_names,
                          image_input_names=image_input_names,
-                         is_bgr=is_bgr,
-                         red_bias=red_bias,
-                         green_bias=green_bias,
-                         blue_bias=blue_bias,
-                         gray_bias=gray_bias,
-                         image_scale=image_scale,
+                         preprocessing_args=preprocessing_args,
+                         image_output_names=image_output_names,
+                         deprocessing_args=deprocessing_args,
                          class_labels=class_labels,
                          predicted_feature_name=predicted_feature_name,
                          predicted_probabilities_output=predicted_probabilities_output,
@@ -541,13 +675,10 @@ def convertToSpec(model,
                                            input_names=input_names,
                                            output_names=output_names,
                                            image_input_names=image_input_names,
+                                           preprocessing_args=preprocessing_args,
+                                           image_output_names=image_output_names,
+                                           deprocessing_args=deprocessing_args,
                                            input_name_shape_dict=input_name_shape_dict,
-                                           is_bgr=is_bgr,
-                                           red_bias=red_bias,
-                                           green_bias=green_bias,
-                                           blue_bias=blue_bias,
-                                           gray_bias=gray_bias,
-                                           image_scale=image_scale,
                                            class_labels=class_labels,
                                            predicted_feature_name=predicted_feature_name,
                                            predicted_probabilities_output=predicted_probabilities_output,
@@ -568,13 +699,10 @@ def convert(model,
                   input_names = None,
                   output_names = None,
                   image_input_names = None,
+                  preprocessing_args = {},
+                  image_output_names = None,
+                  deprocessing_args = {},
                   input_name_shape_dict = {},
-                  is_bgr = False,
-                  red_bias = 0.0,
-                  green_bias = 0.0,
-                  blue_bias = 0.0,
-                  gray_bias = 0.0,
-                  image_scale = 1.0,
                   class_labels = None,
                   predicted_feature_name = None,
                   model_precision = _MLMODEL_FULL_PRECISION,
@@ -583,6 +711,7 @@ def convert(model,
                   custom_conversion_functions = None):
     
     """
+    Hello from therer
     Convert a Keras model to Core ML protobuf specification (.mlmodel).
         
     Parameters
@@ -745,13 +874,10 @@ def convert(model,
                       input_names,
                       output_names,
                       image_input_names,
+                      preprocessing_args,
+                      image_output_names,
+                      deprocessing_args, 
                       input_name_shape_dict,
-                      is_bgr,
-                      red_bias,
-                      green_bias,
-                      blue_bias,
-                      gray_bias,
-                      image_scale,
                       class_labels,
                       predicted_feature_name,
                       model_precision,
